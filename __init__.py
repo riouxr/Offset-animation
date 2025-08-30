@@ -1,10 +1,10 @@
 bl_info = {
-    "name": "Animation Offset Duplicator (Recreate Clean via Collection)",
+    "name": "Animation Offset Duplicator (Recreate Clean via Named Collection)",
     "blender": (4, 5, 0),
     "category": "Object",
     "author": "ChatGPT",
-    "version": (1, 19, 0),
-    "description": "Recreate duplicates cleanly by placing them in a dedicated collection and deleting that collection on rerun. Includes Cycles config, randomness via Delta transforms, Instances, and Done.",
+    "version": (1, 0, 0),
+    "description": "Recreate duplicates cleanly by placing them in a named collection '<ObjectName>_dups' and deleting that collection on rerun. Includes Cycles config, randomness via Delta transforms, Instances, and Done.",
 }
 
 import bpy
@@ -15,13 +15,12 @@ from mathutils import Vector, Euler
 from bpy.types import Panel, Operator, PropertyGroup
 from bpy.props import IntProperty, EnumProperty, BoolProperty, FloatProperty, PointerProperty
 
+# --- Keys ---
 AOD_GROUP_KEY = "aod_group_id"
 AOD_IS_SOURCE_KEY = "aod_is_source"
 AOD_INDEX_KEY = "aod_index"
-AOD_COLL_PREFIX = "AOD_"  # collection name prefix
 
-# ---------------- Utils ----------------
-
+# --- Utils ---
 def _object_has_action(obj):
     return (obj and obj.animation_data and obj.animation_data.action)
 
@@ -74,13 +73,10 @@ def _apply_random_deltas(obj, s):
     _clear_delta_transforms(obj)
     if not s.add_randomness:
         return 0.0
-    # Delta translation
     tx = _rand_between(s.tx_min, s.tx_max)
     ty = _rand_between(s.ty_min, s.ty_max)
     tz = _rand_between(s.tz_min, s.tz_max)
     obj.delta_location = Vector((tx, ty, tz))
-    # Delta rotation
-    import math
     rx = math.radians(_rand_between(s.rx_min, s.rx_max))
     ry = math.radians(_rand_between(s.ry_min, s.ry_max))
     rz = math.radians(_rand_between(s.rz_min, s.rz_max))
@@ -88,42 +84,33 @@ def _apply_random_deltas(obj, s):
         obj.delta_rotation_quaternion = Euler((rx, ry, rz), 'XYZ').to_quaternion()
     else:
         obj.delta_rotation_euler = Euler((rx, ry, rz), 'XYZ')
-    # Delta scale
     sx = _rand_between(s.sx_min, s.sx_max)
     sy = _rand_between(s.sy_min, s.sy_max)
     sz = _rand_between(s.sz_min, s.sz_max)
     obj.delta_scale = Vector((sx, sy, sz))
-    # Time jitter
     return _rand_between(s.frame_jitter_min, s.frame_jitter_max)
 
 def _ensure_group_for_source(src) -> str:
-    group_id = src.get(AOD_GROUP_KEY)
-    if not group_id:
-        group_id = str(uuid.uuid4())
-        src[AOD_GROUP_KEY] = group_id
+    gid = src.get(AOD_GROUP_KEY)
+    if not gid:
+        gid = str(uuid.uuid4())
+        src[AOD_GROUP_KEY] = gid
         src[AOD_IS_SOURCE_KEY] = True
-    return group_id
+    return gid
 
-def _collection_name(group_id: str) -> str:
-    return f"{AOD_COLL_PREFIX}{group_id[:8]}"
+def _desired_collection_name_for_source(src) -> str:
+    return f"{src.name}_dups"
 
-def _get_group_collection(group_id: str):
-    name = _collection_name(group_id)
-    return bpy.data.collections.get(name)
+def _get_collection_by_group_id(group_id: str):
+    # Find collection that has our group id tag
+    for coll in bpy.data.collections:
+        if coll.get(AOD_GROUP_KEY) == group_id:
+            return coll
+    return None
 
-def _create_group_collection(group_id: str):
-    name = _collection_name(group_id)
-    coll = bpy.data.collections.new(name)
-    # Put it beside the source collection: link to scene root so it's visible everywhere.
-    bpy.context.scene.collection.children.link(coll)
-    return coll
-
-def _hard_delete_group_collection(group_id: str) -> int:
-    """Delete the AOD collection and its objects, regardless of context."""
-    coll = _get_group_collection(group_id)
+def _hard_delete_collection(coll) -> int:
     if not coll:
         return 0
-    # Remove all objects in that collection (datablock remove, unlinks from all other collections too)
     to_delete = list(coll.objects)
     deleted = 0
     for ob in to_delete:
@@ -131,7 +118,6 @@ def _hard_delete_group_collection(group_id: str) -> int:
             bpy.data.objects.remove(ob, do_unlink=True)
             deleted += 1
         except Exception:
-            # fallback: unlink then remove
             try:
                 for c in list(ob.users_collection):
                     c.objects.unlink(ob)
@@ -139,11 +125,9 @@ def _hard_delete_group_collection(group_id: str) -> int:
                 deleted += 1
             except Exception:
                 pass
-    # Finally remove the collection itself
     try:
         bpy.data.collections.remove(coll, do_unlink=True)
     except Exception:
-        # If some view layer still holds it, try unlink from scene then remove
         try:
             bpy.context.scene.collection.children.unlink(coll)
             bpy.data.collections.remove(coll, do_unlink=True)
@@ -152,7 +136,6 @@ def _hard_delete_group_collection(group_id: str) -> int:
     return deleted
 
 def _cleanup_orphan_actions():
-    # Remove unused actions we may have created
     for act in list(bpy.data.actions):
         if not act.use_fake_user and act.users == 0:
             try:
@@ -160,27 +143,21 @@ def _cleanup_orphan_actions():
             except Exception:
                 pass
 
-# ---------------- Properties ----------------
-
+# --- Properties ---
 class AOD_Settings(PropertyGroup):
     copies: IntProperty(name="Copies", default=5, min=1)
     frame_offset: IntProperty(name="Frame Offset", default=10)
-    use_instances: BoolProperty(
-        name="Use Instances",
-        description="Linked data (Alt+D style). Off = full copy",
-        default=True,
-    )
-    # Cycles modes
+    use_instances: BoolProperty(name="Use Instances", default=True)
     mode_items = [
-        ('NONE',          "No Cycles",          "Do not repeat"),
-        ('REPEAT',        "Repeat Motion",      "Repeat without value offset"),
+        ('NONE',          "No Cycles", "Do not repeat"),
+        ('REPEAT',        "Repeat Motion", "Repeat without value offset"),
         ('REPEAT_OFFSET', "Repeat With Offset", "Repeat with additive value offset"),
-        ('MIRROR',        "Repeat Mirrored",    "Flip each cycle across X"),
+        ('MIRROR',        "Repeat Mirrored", "Flip each cycle across X"),
     ]
     mode_before: EnumProperty(name="Before", items=mode_items, default='NONE')
-    mode_after:  EnumProperty(name="After",  items=mode_items, default='REPEAT')
+    mode_after:  EnumProperty(name="After", items=mode_items, default='REPEAT')
     cycles_before: IntProperty(name="Cycles Before", default=0, min=0, description="0 = infinite")
-    cycles_after:  IntProperty(name="Cycles After",  default=0, min=0, description="0 = infinite")
+    cycles_after:  IntProperty(name="Cycles After", default=0, min=0, description="0 = infinite")
     apply_to_original: BoolProperty(name="Apply to Original", default=False)
     use_influence: BoolProperty(name="Use Influence", default=False)
     influence: FloatProperty(name="Influence", default=1.0, min=0.0, max=1.0)
@@ -189,7 +166,6 @@ class AOD_Settings(PropertyGroup):
     frame_end:   IntProperty(name="End",   default=250)
     blend_in:  FloatProperty(name="Blend In",  default=0.0, min=0.0)
     blend_out: FloatProperty(name="Blend Out", default=0.0, min=0.0)
-    # Randomness
     add_randomness: BoolProperty(name="Add Randomness", default=False)
     frame_jitter_min: IntProperty(name="Frame Jitter Min", default=0)
     frame_jitter_max: IntProperty(name="Frame Jitter Max", default=0)
@@ -203,8 +179,7 @@ class AOD_Settings(PropertyGroup):
     sy_min: FloatProperty(name="Sy Min", default=1.0); sy_max: FloatProperty(name="Sy Max", default=1.0)
     sz_min: FloatProperty(name="Sz Min", default=1.0); sz_max: FloatProperty(name="Sz Max", default=1.0)
 
-# ---------------- Operator ----------------
-
+# --- Operator ---
 class AOD_OT_recreate(Operator):
     bl_idname = "object.aod_recreate_duplicates"
     bl_label = "Create / Recreate Duplicates"
@@ -212,51 +187,47 @@ class AOD_OT_recreate(Operator):
 
     def execute(self, context):
         s = context.scene.aod_settings
-        active = context.active_object
-        if active is None:
+        src = context.active_object
+        if not src:
             self.report({'ERROR'}, "No active object.")
             return {'CANCELLED'}
-
-        # Resolve source
-        src = active
         if not _object_has_action(src):
             self.report({'ERROR'}, "Source object must have an Action with keyframes.")
             return {'CANCELLED'}
 
-        # Ensure/obtain group id on the source
-        group_id = _ensure_group_for_source(src)
+        # Ensure group ID on source
+        gid = _ensure_group_for_source(src)
 
-        # If a previous AOD collection exists, hard-delete it (and its objects)
-        deleted = _hard_delete_group_collection(group_id)
+        # Find old collection by group ID and nuke it
+        old_coll = _get_collection_by_group_id(gid)
+        deleted = _hard_delete_collection(old_coll)
         _cleanup_orphan_actions()
 
-        # Recreate a fresh AOD collection
-        aod_coll = _create_group_collection(group_id)
+        # Create a fresh collection with readable name
+        desired_name = _desired_collection_name_for_source(src)
+        new_coll = bpy.data.collections.new(desired_name)
+        new_coll[AOD_GROUP_KEY] = gid  # tag the collection with the group id
+        bpy.context.scene.collection.children.link(new_coll)
 
         base_action = src.animation_data.action
-
-        # Optionally apply cycles to the original (no time shift)
         if s.apply_to_original:
             _apply_cycles_modifier(base_action, s)
 
-        # Build duplicates inside the AOD collection ONLY
+        # Create duplicates inside that collection only
         made = 0
         for i in range(1, s.copies + 1):
             dup = src.copy()
             dup.name = f"{src.name}_dup_{i:02d}"
             dup.data = (src.data if s.use_instances else (src.data.copy() if src.data else None))
 
-            # Make sure dup is ONLY in the AOD collection
-            # (avoid auto-linking to the same collection as the source)
+            # ensure dup is only in our collection
             for c in list(dup.users_collection):
                 c.objects.unlink(dup)
-            aod_coll.objects.link(dup)
+            new_coll.objects.link(dup)
 
-            # Tag for completeness (not required for cleanup now)
-            dup[AOD_GROUP_KEY] = group_id
+            dup[AOD_GROUP_KEY] = gid
             dup[AOD_INDEX_KEY] = i
 
-            # Per-dup action copy with time offset
             dup.animation_data_create()
             act = base_action.copy()
             act.name = f"{base_action.name}_dup_{i:02d}"
@@ -268,10 +239,12 @@ class AOD_OT_recreate(Operator):
                 _offset_action_keyframes_in_time(act, dx)
 
             _apply_cycles_modifier(act, s)
-
             made += 1
 
-        self.report({'INFO'}, f"Deleted {deleted} previous duplicates. Created {made} new duplicates in {_collection_name(group_id)}.")
+        # If the source was renamed since last run, ensure the collection follows the new name next time:
+        new_coll.name = _desired_collection_name_for_source(src)
+
+        self.report({'INFO'}, f"Deleted {deleted} old duplicates. Created {made} new duplicates in '{new_coll.name}'.")
         return {'FINISHED'}
 
 class AOD_OT_done(Operator):
@@ -285,21 +258,19 @@ class AOD_OT_done(Operator):
             self.report({'ERROR'}, "No active object.")
             return {'CANCELLED'}
         gid = active.get(AOD_GROUP_KEY)
-        # Clear tags on source & dups; leave objects/collection intact
-        # (You can delete the AOD_ collection manually later if needed)
+        # Clear tags on any members + source
         for ob in bpy.data.objects:
             if ob.get(AOD_GROUP_KEY) == gid:
-                for key in (AOD_GROUP_KEY, AOD_IS_SOURCE_KEY, AOD_INDEX_KEY):
-                    if key in ob: del ob[key]
+                for k in (AOD_GROUP_KEY, AOD_IS_SOURCE_KEY, AOD_INDEX_KEY):
+                    if k in ob: del ob[k]
         if gid and AOD_GROUP_KEY in active:
             del active[AOD_GROUP_KEY]
         if AOD_IS_SOURCE_KEY in active:
             del active[AOD_IS_SOURCE_KEY]
-        self.report({'INFO'}, "Cleared group tags.")
+        self.report({'INFO'}, "Cleared group tags (objects/collection kept).")
         return {'FINISHED'}
 
-# ---------------- UI ----------------
-
+# --- UI ---
 class AOD_PT_panel(Panel):
     bl_label = "Animation Offset Duplicator"
     bl_idname = "AOD_PT_panel"
@@ -310,7 +281,6 @@ class AOD_PT_panel(Panel):
     def draw(self, context):
         s = context.scene.aod_settings
         layout = self.layout
-
         col = layout.column(align=True)
         col.prop(s, "copies"); col.prop(s, "frame_offset"); col.prop(s, "use_instances")
 
@@ -321,8 +291,7 @@ class AOD_PT_panel(Panel):
         layout.prop(s, "apply_to_original")
 
         layout.prop(s, "use_influence")
-        if s.use_influence:
-            layout.prop(s, "influence")
+        if s.use_influence: layout.prop(s, "influence")
 
         layout.prop(s, "use_restricted_range")
         if s.use_restricted_range:
@@ -353,25 +322,16 @@ class AOD_PT_panel(Panel):
         row.operator("object.aod_recreate_duplicates", icon='DUPLICATE', text="Create / Recreate Duplicates")
         row.operator("object.aod_finish_group", icon='CHECKMARK', text="Done")
 
-# ---------------- Registration ----------------
-
+# --- Registration ---
 classes = (AOD_Settings, AOD_OT_recreate, AOD_OT_done, AOD_PT_panel)
-
 def register():
-    for cls in classes:
-        bpy.utils.register_class(cls)
+    for cls in classes: bpy.utils.register_class(cls)
     bpy.types.Scene.aod_settings = PointerProperty(type=AOD_Settings)
-
 def unregister():
-    try:
-        del bpy.types.Scene.aod_settings
-    except Exception:
-        pass
+    try: del bpy.types.Scene.aod_settings
+    except Exception: pass
     for cls in reversed(classes):
-        try:
-            bpy.utils.unregister_class(cls)
-        except Exception:
-            pass
-
+        try: bpy.utils.unregister_class(cls)
+        except Exception: pass
 if __name__ == "__main__":
     register()
