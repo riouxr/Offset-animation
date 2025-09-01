@@ -1,10 +1,11 @@
+# SPDX-License-Identifier: GPL-2.0-or-later
 bl_info = {
-    "name": "Animation Offset Duplicator (Recreate Clean via Named Collection)",
+    "name": "Animation Offset Duplicator + Partial Cycle",
     "blender": (4, 5, 0),
     "category": "Object",
     "author": "ChatGPT",
-    "version": (1, 0, 0),
-    "description": "Recreate duplicates cleanly by placing them in a named collection '<ObjectName>_dups' and deleting that collection on rerun. Includes Cycles config, randomness via Delta transforms, Instances, and Done.",
+    "version": (1, 2, 0),
+    "description": "Duplicate objects with offset & randomness. Includes Cycles config. Adds Partial Cycle tool for repeating a keyframe sub-range with pre/post roll.",
 }
 
 import bpy
@@ -102,7 +103,6 @@ def _desired_collection_name_for_source(src) -> str:
     return f"{src.name}_dups"
 
 def _get_collection_by_group_id(group_id: str):
-    # Find collection that has our group id tag
     for coll in bpy.data.collections:
         if coll.get(AOD_GROUP_KEY) == group_id:
             return coll
@@ -195,36 +195,29 @@ class AOD_OT_recreate(Operator):
             self.report({'ERROR'}, "Source object must have an Action with keyframes.")
             return {'CANCELLED'}
 
-        # Ensure group ID on source
         gid = _ensure_group_for_source(src)
 
-        # Find old collection by group ID and nuke it
         old_coll = _get_collection_by_group_id(gid)
         deleted = _hard_delete_collection(old_coll)
         _cleanup_orphan_actions()
 
-        # Create a fresh collection with readable name
         desired_name = _desired_collection_name_for_source(src)
         new_coll = bpy.data.collections.new(desired_name)
-        new_coll[AOD_GROUP_KEY] = gid  # tag the collection with the group id
+        new_coll[AOD_GROUP_KEY] = gid
         bpy.context.scene.collection.children.link(new_coll)
 
         base_action = src.animation_data.action
         if s.apply_to_original:
             _apply_cycles_modifier(base_action, s)
 
-        # Create duplicates inside that collection only
         made = 0
         for i in range(1, s.copies + 1):
             dup = src.copy()
             dup.name = f"{src.name}_dup_{i:02d}"
             dup.data = (src.data if s.use_instances else (src.data.copy() if src.data else None))
-
-            # ensure dup is only in our collection
             for c in list(dup.users_collection):
                 c.objects.unlink(dup)
             new_coll.objects.link(dup)
-
             dup[AOD_GROUP_KEY] = gid
             dup[AOD_INDEX_KEY] = i
 
@@ -241,9 +234,7 @@ class AOD_OT_recreate(Operator):
             _apply_cycles_modifier(act, s)
             made += 1
 
-        # If the source was renamed since last run, ensure the collection follows the new name next time:
         new_coll.name = _desired_collection_name_for_source(src)
-
         self.report({'INFO'}, f"Deleted {deleted} old duplicates. Created {made} new duplicates in '{new_coll.name}'.")
         return {'FINISHED'}
 
@@ -258,7 +249,6 @@ class AOD_OT_done(Operator):
             self.report({'ERROR'}, "No active object.")
             return {'CANCELLED'}
         gid = active.get(AOD_GROUP_KEY)
-        # Clear tags on any members + source
         for ob in bpy.data.objects:
             if ob.get(AOD_GROUP_KEY) == gid:
                 for k in (AOD_GROUP_KEY, AOD_IS_SOURCE_KEY, AOD_INDEX_KEY):
@@ -268,6 +258,113 @@ class AOD_OT_done(Operator):
         if AOD_IS_SOURCE_KEY in active:
             del active[AOD_IS_SOURCE_KEY]
         self.report({'INFO'}, "Cleared group tags (objects/collection kept).")
+        return {'FINISHED'}
+
+# --- Partial Cycle (standalone) ---
+def _collect_points_in_range(fcu, f_start, f_end):
+    pts = []
+    for kp in fcu.keyframe_points:
+        fr = kp.co.x
+        if f_start <= fr <= f_end:
+            pts.append(kp)
+    return pts
+
+def _insert_points(fcu, baked_points):
+    for (val, hly, hry, frame, hlx, hrx) in baked_points:
+        new_pt = fcu.keyframe_points.insert(frame=frame, value=val, options={'FAST'})
+        new_pt.handle_left.x = hlx
+        new_pt.handle_left.y = hly
+        new_pt.handle_right.x = hrx
+        new_pt.handle_right.y = hry
+    fcu.update()
+
+def _evaluate_delta(fcu, f_start, f_end):
+    try:
+        v0 = fcu.evaluate(f_start)
+        v1 = fcu.evaluate(f_end)
+        return (v1 - v0)
+    except Exception:
+        return 0.0
+
+class PCycleProps(PropertyGroup):
+    frame_start: IntProperty(name="Start", default=1)
+    frame_end: IntProperty(name="End", default=5)
+    repeats: IntProperty(name="Repeats", default=3, min=1)
+    roll_mode: EnumProperty(
+        name="Roll",
+        items=(('PREROLL', "Preroll (Left)", ""),
+               ('POSTROLL', "Post-roll (Right)", "")),
+        default='POSTROLL',
+    )
+    repeat_mode: EnumProperty(
+        name="Repeat Mode",
+        items=(('REPEAT', "Repeat", "Duplicate keys exactly"),
+               ('REPEAT_OFFSET', "Repeat With Offset", "Add delta each cycle"),
+               ('MIRROR', "Mirror", "Alternate mirrored repeats")),
+        default='REPEAT_OFFSET',
+    )
+    clamp_to_integer_frames: BoolProperty(name="Clamp to Integer Frames", default=True)
+
+
+class PCYCLE_OT_duplicate_with_offset(Operator):
+    bl_idname = "pcycle.duplicate_with_offset"
+    bl_label = "Duplicate Range"
+    bl_options = {'REGISTER', 'UNDO'}
+
+    def execute(self, context):
+        s = context.scene.pcycle_props
+        f0, f1 = sorted((s.frame_start, s.frame_end))
+        length = f1 - f0
+        if length <= 0:
+            self.report({'ERROR'}, "Invalid range.")
+            return {'CANCELLED'}
+
+        total_inserted = 0
+        for ob in context.selected_objects:  # always process all selected
+            if not ob.animation_data or not ob.animation_data.action:
+                continue
+            action = ob.animation_data.action
+            for fcu in action.fcurves:
+                src_pts = _collect_points_in_range(fcu, f0, f1)
+                if not src_pts:
+                    continue
+                baked_src = [(kp.co.x, kp.co.y,
+                              kp.handle_left.x, kp.handle_left.y,
+                              kp.handle_right.x, kp.handle_right.y)
+                             for kp in src_pts]
+                delta = _evaluate_delta(fcu, f0, f1)
+
+                for i in range(1, s.repeats + 1):
+                    if s.roll_mode == 'POSTROLL':
+                        time_shift = i * length
+                    else:
+                        time_shift = -i * length
+
+                    # Value shift / transform
+                    if s.repeat_mode == 'REPEAT':
+                        val_shift = 0
+                    elif s.repeat_mode == 'REPEAT_OFFSET':
+                        val_shift = (i if s.roll_mode == 'POSTROLL' else -i) * delta
+                    elif s.repeat_mode == 'MIRROR':
+                        # Alternate sign every other repeat
+                        sign = -1 if (i % 2) else 1
+                        val_shift = sign * delta
+                    else:
+                        val_shift = 0
+
+                    baked_points = []
+                    for (x, y, hlx, hly, hrx, hry) in baked_src:
+                        nx = x + time_shift
+                        hlx = hlx + time_shift
+                        hrx = hrx + time_shift
+                        if s.clamp_to_integer_frames:
+                            nx, hlx, hrx = round(nx), round(hlx), round(hrx)
+                        baked_points.append((y + val_shift, hly + val_shift,
+                                             hry + val_shift, nx, hlx, hrx))
+                    _insert_points(fcu, baked_points)
+                    total_inserted += len(baked_points)
+
+        self.report({'INFO'}, f"Inserted {total_inserted} keyframes.")
         return {'FINISHED'}
 
 # --- UI ---
@@ -302,17 +399,13 @@ class AOD_PT_panel(Panel):
         layout.prop(s, "add_randomness")
         if s.add_randomness:
             box = layout.box()
-            box.label(text="Time Jitter (frames):")
             r = box.row(align=True); r.prop(s, "frame_jitter_min"); r.prop(s, "frame_jitter_max")
-            box.label(text="Translation (Delta):")
             r = box.row(align=True); r.prop(s, "tx_min"); r.prop(s, "tx_max")
             r = box.row(align=True); r.prop(s, "ty_min"); r.prop(s, "ty_max")
             r = box.row(align=True); r.prop(s, "tz_min"); r.prop(s, "tz_max")
-            box.label(text="Rotation (Delta, degrees):")
             r = box.row(align=True); r.prop(s, "rx_min"); r.prop(s, "rx_max")
             r = box.row(align=True); r.prop(s, "ry_min"); r.prop(s, "ry_max")
             r = box.row(align=True); r.prop(s, "rz_min"); r.prop(s, "rz_max")
-            box.label(text="Scale (Delta factors):")
             r = box.row(align=True); r.prop(s, "sx_min"); r.prop(s, "sx_max")
             r = box.row(align=True); r.prop(s, "sy_min"); r.prop(s, "sy_max")
             r = box.row(align=True); r.prop(s, "sz_min"); r.prop(s, "sz_max")
@@ -322,16 +415,34 @@ class AOD_PT_panel(Panel):
         row.operator("object.aod_recreate_duplicates", icon='DUPLICATE', text="Create / Recreate Duplicates")
         row.operator("object.aod_finish_group", icon='CHECKMARK', text="Done")
 
+        # --- Partial Cycle UI ---
+        layout.separator(factor=1.0)
+        box = layout.box()
+        box.label(text="Partial Cycle (Offset)")
+        s2 = context.scene.pcycle_props
+        row = box.row(align=True)
+        row.prop(s2, "frame_start"); row.prop(s2, "frame_end")
+        box.prop(s2, "roll_mode", text="Roll Mode")
+        box.prop(s2, "repeat_mode", text="Mode")   # NEW dropdown
+        row = box.row(align=True)
+        row.prop(s2, "repeats"); row.prop(s2, "clamp_to_integer_frames")
+        box.operator("pcycle.duplicate_with_offset", icon="KEYFRAME")
+
+
 # --- Registration ---
-classes = (AOD_Settings, AOD_OT_recreate, AOD_OT_done, AOD_PT_panel)
+classes = (AOD_Settings, AOD_OT_recreate, AOD_OT_done,
+           PCycleProps, PCYCLE_OT_duplicate_with_offset,
+           AOD_PT_panel)
+
 def register():
     for cls in classes: bpy.utils.register_class(cls)
     bpy.types.Scene.aod_settings = PointerProperty(type=AOD_Settings)
+    bpy.types.Scene.pcycle_props = PointerProperty(type=PCycleProps)
+
 def unregister():
-    try: del bpy.types.Scene.aod_settings
-    except Exception: pass
-    for cls in reversed(classes):
-        try: bpy.utils.unregister_class(cls)
-        except Exception: pass
+    del bpy.types.Scene.aod_settings
+    del bpy.types.Scene.pcycle_props
+    for cls in reversed(classes): bpy.utils.unregister_class(cls)
+
 if __name__ == "__main__":
     register()

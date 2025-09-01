@@ -1,6 +1,6 @@
 schema_version = "1.0.0"
 id = "OffsetAnim"
-version = "1.0.0"
+version = "1.2.0"
 name = "Offset Animation"
 tagline = "Allows you to make multiple copies and offset animation"
 maintainer = "Blender Bob"
