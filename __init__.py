@@ -4,8 +4,8 @@ bl_info = {
     "blender": (4, 5, 0),
     "category": "Object",
     "author": "ChatGPT",
-    "version": (1, 2, 0),
-    "description": "Duplicate objects with offset & randomness. Includes Cycles config. Adds Partial Cycle tool for repeating a keyframe sub-range with pre/post roll.",
+    "version": (1, 3, 0),
+    "description": "Duplicate objects with offset & randomness. Includes Cycles config. Adds Partial Cycle tool for repeating a keyframe sub-range with pre/post roll. Now offsets shapekey (Key) animation as well.",
 }
 
 import bpy
@@ -22,8 +22,31 @@ AOD_IS_SOURCE_KEY = "aod_is_source"
 AOD_INDEX_KEY = "aod_index"
 
 # --- Utils ---
-def _object_has_action(obj):
+def _object_has_obj_action(obj):
     return (obj and obj.animation_data and obj.animation_data.action)
+
+def _get_shapekey_data(obj):
+    try:
+        return obj.data.shape_keys if (obj and obj.data and getattr(obj.data, "shape_keys", None)) else None
+    except Exception:
+        return None
+
+def _object_has_shapekey_action(obj):
+    sk = _get_shapekey_data(obj)
+    return (sk and sk.animation_data and sk.animation_data.action)
+
+def _object_has_any_action(obj):
+    return _object_has_obj_action(obj) or _object_has_shapekey_action(obj)
+
+
+def _iter_actions_for_object(obj):
+    """Yield tuples of (owner_id, action, kind) for both Object and Key datablocks."""
+    if _object_has_obj_action(obj):
+        yield (obj, obj.animation_data.action, 'OBJECT')
+    sk = _get_shapekey_data(obj)
+    if sk and sk.animation_data and sk.animation_data.action:
+        yield (sk, sk.animation_data.action, 'SHAPEKEY')
+
 
 def _offset_action_keyframes_in_time(action: bpy.types.Action, dx: float):
     if not action or dx == 0:
@@ -34,6 +57,7 @@ def _offset_action_keyframes_in_time(action: bpy.types.Action, dx: float):
             kp.handle_left.x += dx
             kp.handle_right.x += dx
         fcu.update()
+
 
 def _apply_cycles_modifier(action: bpy.types.Action, s):
     if not action:
@@ -58,9 +82,11 @@ def _apply_cycles_modifier(action: bpy.types.Action, s):
             cyc.blend_in  = 0.0
             cyc.blend_out = 0.0
 
+
 def _rand_between(a: float, b: float) -> float:
     lo, hi = (a, b) if a <= b else (b, a)
     return random.uniform(lo, hi)
+
 
 def _clear_delta_transforms(obj):
     obj.delta_location = Vector((0.0, 0.0, 0.0))
@@ -69,6 +95,7 @@ def _clear_delta_transforms(obj):
     else:
         obj.delta_rotation_euler = Euler((0.0, 0.0, 0.0), 'XYZ')
     obj.delta_scale = Vector((1.0, 1.0, 1.0))
+
 
 def _apply_random_deltas(obj, s):
     _clear_delta_transforms(obj)
@@ -91,6 +118,7 @@ def _apply_random_deltas(obj, s):
     obj.delta_scale = Vector((sx, sy, sz))
     return _rand_between(s.frame_jitter_min, s.frame_jitter_max)
 
+
 def _ensure_group_for_source(src) -> str:
     gid = src.get(AOD_GROUP_KEY)
     if not gid:
@@ -99,14 +127,17 @@ def _ensure_group_for_source(src) -> str:
         src[AOD_IS_SOURCE_KEY] = True
     return gid
 
+
 def _desired_collection_name_for_source(src) -> str:
     return f"{src.name}_dups"
+
 
 def _get_collection_by_group_id(group_id: str):
     for coll in bpy.data.collections:
         if coll.get(AOD_GROUP_KEY) == group_id:
             return coll
     return None
+
 
 def _hard_delete_collection(coll) -> int:
     if not coll:
@@ -134,6 +165,7 @@ def _hard_delete_collection(coll) -> int:
         except Exception:
             pass
     return deleted
+
 
 def _cleanup_orphan_actions():
     for act in list(bpy.data.actions):
@@ -191,9 +223,14 @@ class AOD_OT_recreate(Operator):
         if not src:
             self.report({'ERROR'}, "No active object.")
             return {'CANCELLED'}
-        if not _object_has_action(src):
-            self.report({'ERROR'}, "Source object must have an Action with keyframes.")
+        if not _object_has_any_action(src):
+            self.report({'ERROR'}, "Source must have an Action on the Object and/or its Shapekeys.")
             return {'CANCELLED'}
+
+        # If there is shapekey animation and use_instances is ON, per-duplicate timing would
+        # otherwise affect all instances (Key action targets the Key ID). In that case we silently
+        # force data copy for the duplicates to give each its own Key datablock.
+        sk_has_action = _object_has_shapekey_action(src)
 
         gid = _ensure_group_for_source(src)
 
@@ -206,37 +243,76 @@ class AOD_OT_recreate(Operator):
         new_coll[AOD_GROUP_KEY] = gid
         bpy.context.scene.collection.children.link(new_coll)
 
-        base_action = src.animation_data.action
+        # Apply cycles to original actions if requested
         if s.apply_to_original:
-            _apply_cycles_modifier(base_action, s)
+            for owner, action, _kind in _iter_actions_for_object(src):
+                _apply_cycles_modifier(action, s)
 
         made = 0
+        base_obj_action = src.animation_data.action if _object_has_obj_action(src) else None
+        base_sk_action = _get_shapekey_data(src).animation_data.action if sk_has_action else None
+
         for i in range(1, s.copies + 1):
             dup = src.copy()
             dup.name = f"{src.name}_dup_{i:02d}"
-            dup.data = (src.data if s.use_instances else (src.data.copy() if src.data else None))
+
+            # Force unique mesh data if shapekey animation exists so we can offset per duplicate
+            force_unique_data = sk_has_action
+            if s.use_instances and not force_unique_data:
+                dup.data = (src.data if s.use_instances else (src.data.copy() if src.data else None))
+            else:
+                dup.data = (src.data.copy() if src.data else None)
+
             for c in list(dup.users_collection):
                 c.objects.unlink(dup)
             new_coll.objects.link(dup)
             dup[AOD_GROUP_KEY] = gid
             dup[AOD_INDEX_KEY] = i
 
-            dup.animation_data_create()
-            act = base_action.copy()
-            act.name = f"{base_action.name}_dup_{i:02d}"
-            dup.animation_data.action = act
+            # OBJECT action copy/offset
+            if base_obj_action:
+                dup.animation_data_create()
+                act_obj = base_obj_action.copy()
+                act_obj.name = f"{base_obj_action.name}_dup_{i:02d}"
+                dup.animation_data.action = act_obj
+            else:
+                act_obj = None
 
+            # SHAPEKEY action copy/offset
+            act_sk = None
+            if base_sk_action:
+                sk = _get_shapekey_data(dup)
+                if sk:
+                    if not sk.animation_data:
+                        sk.animation_data_create()
+                    act_sk = base_sk_action.copy()
+                    act_sk.name = f"{base_sk_action.name}_dup_{i:02d}"
+                    sk.animation_data.action = act_sk
+
+            # Random transform deltas + frame jitter
             jitter = _apply_random_deltas(dup, s) if s.add_randomness else (_clear_delta_transforms(dup) or 0.0)
             dx = s.frame_offset * i + jitter
             if dx:
-                _offset_action_keyframes_in_time(act, dx)
+                if act_obj:
+                    _offset_action_keyframes_in_time(act_obj, dx)
+                if act_sk:
+                    _offset_action_keyframes_in_time(act_sk, dx)
 
-            _apply_cycles_modifier(act, s)
+            # Apply cycles modifiers to both actions
+            if act_obj:
+                _apply_cycles_modifier(act_obj, s)
+            if act_sk:
+                _apply_cycles_modifier(act_sk, s)
+
             made += 1
 
         new_coll.name = _desired_collection_name_for_source(src)
-        self.report({'INFO'}, f"Deleted {deleted} old duplicates. Created {made} new duplicates in '{new_coll.name}'.")
+        msg = f"Deleted {deleted} old duplicates. Created {made} new duplicates in '{new_coll.name}'."
+        if sk_has_action and s.use_instances:
+            msg += " Note: Shapekey animation detected; duplicates use unique mesh data to allow per-duplicate timing."
+        self.report({'INFO'}, msg)
         return {'FINISHED'}
+
 
 class AOD_OT_done(Operator):
     bl_idname = "object.aod_finish_group"
@@ -260,6 +336,7 @@ class AOD_OT_done(Operator):
         self.report({'INFO'}, "Cleared group tags (objects/collection kept).")
         return {'FINISHED'}
 
+
 # --- Partial Cycle (standalone) ---
 def _collect_points_in_range(fcu, f_start, f_end):
     pts = []
@@ -268,6 +345,7 @@ def _collect_points_in_range(fcu, f_start, f_end):
         if f_start <= fr <= f_end:
             pts.append(kp)
     return pts
+
 
 def _insert_points(fcu, baked_points):
     for (val, hly, hry, frame, hlx, hrx) in baked_points:
@@ -278,6 +356,7 @@ def _insert_points(fcu, baked_points):
         new_pt.handle_right.y = hry
     fcu.update()
 
+
 def _evaluate_delta(fcu, f_start, f_end):
     try:
         v0 = fcu.evaluate(f_start)
@@ -285,6 +364,7 @@ def _evaluate_delta(fcu, f_start, f_end):
         return (v1 - v0)
     except Exception:
         return 0.0
+
 
 class PCycleProps(PropertyGroup):
     frame_start: IntProperty(name="Start", default=1)
@@ -321,51 +401,53 @@ class PCYCLE_OT_duplicate_with_offset(Operator):
 
         total_inserted = 0
         for ob in context.selected_objects:  # always process all selected
-            if not ob.animation_data or not ob.animation_data.action:
+            # Process Object action and Shapekey action if present
+            actions = list(_iter_actions_for_object(ob))
+            if not actions:
                 continue
-            action = ob.animation_data.action
-            for fcu in action.fcurves:
-                src_pts = _collect_points_in_range(fcu, f0, f1)
-                if not src_pts:
-                    continue
-                baked_src = [(kp.co.x, kp.co.y,
-                              kp.handle_left.x, kp.handle_left.y,
-                              kp.handle_right.x, kp.handle_right.y)
-                             for kp in src_pts]
-                delta = _evaluate_delta(fcu, f0, f1)
+            for owner, action, _kind in actions:
+                for fcu in action.fcurves:
+                    src_pts = _collect_points_in_range(fcu, f0, f1)
+                    if not src_pts:
+                        continue
+                    baked_src = [(kp.co.x, kp.co.y,
+                                  kp.handle_left.x, kp.handle_left.y,
+                                  kp.handle_right.x, kp.handle_right.y)
+                                 for kp in src_pts]
+                    delta = _evaluate_delta(fcu, f0, f1)
 
-                for i in range(1, s.repeats + 1):
-                    if s.roll_mode == 'POSTROLL':
-                        time_shift = i * length
-                    else:
-                        time_shift = -i * length
+                    for i in range(1, s.repeats + 1):
+                        if s.roll_mode == 'POSTROLL':
+                            time_shift = i * length
+                        else:
+                            time_shift = -i * length
 
-                    # Value shift / transform
-                    if s.repeat_mode == 'REPEAT':
-                        val_shift = 0
-                    elif s.repeat_mode == 'REPEAT_OFFSET':
-                        val_shift = (i if s.roll_mode == 'POSTROLL' else -i) * delta
-                    elif s.repeat_mode == 'MIRROR':
-                        # Alternate sign every other repeat
-                        sign = -1 if (i % 2) else 1
-                        val_shift = sign * delta
-                    else:
-                        val_shift = 0
+                        # Value shift / transform
+                        if s.repeat_mode == 'REPEAT':
+                            val_shift = 0
+                        elif s.repeat_mode == 'REPEAT_OFFSET':
+                            val_shift = (i if s.roll_mode == 'POSTROLL' else -i) * delta
+                        elif s.repeat_mode == 'MIRROR':
+                            sign = -1 if (i % 2) else 1
+                            val_shift = sign * delta
+                        else:
+                            val_shift = 0
 
-                    baked_points = []
-                    for (x, y, hlx, hly, hrx, hry) in baked_src:
-                        nx = x + time_shift
-                        hlx = hlx + time_shift
-                        hrx = hrx + time_shift
-                        if s.clamp_to_integer_frames:
-                            nx, hlx, hrx = round(nx), round(hlx), round(hrx)
-                        baked_points.append((y + val_shift, hly + val_shift,
-                                             hry + val_shift, nx, hlx, hrx))
-                    _insert_points(fcu, baked_points)
-                    total_inserted += len(baked_points)
+                        baked_points = []
+                        for (x, y, hlx, hly, hrx, hry) in baked_src:
+                            nx = x + time_shift
+                            hlx2 = hlx + time_shift
+                            hrx2 = hrx + time_shift
+                            if s.clamp_to_integer_frames:
+                                nx, hlx2, hrx2 = round(nx), round(hlx2), round(hrx2)
+                            baked_points.append((y + val_shift, hly + val_shift,
+                                                 hry + val_shift, nx, hlx2, hrx2))
+                        _insert_points(fcu, baked_points)
+                        total_inserted += len(baked_points)
 
         self.report({'INFO'}, f"Inserted {total_inserted} keyframes.")
         return {'FINISHED'}
+
 
 # --- UI ---
 class AOD_PT_panel(Panel):
@@ -423,7 +505,7 @@ class AOD_PT_panel(Panel):
         row = box.row(align=True)
         row.prop(s2, "frame_start"); row.prop(s2, "frame_end")
         box.prop(s2, "roll_mode", text="Roll Mode")
-        box.prop(s2, "repeat_mode", text="Mode")   # NEW dropdown
+        box.prop(s2, "repeat_mode", text="Mode")   # dropdown
         row = box.row(align=True)
         row.prop(s2, "repeats"); row.prop(s2, "clamp_to_integer_frames")
         box.operator("pcycle.duplicate_with_offset", icon="KEYFRAME")
@@ -438,6 +520,7 @@ def register():
     for cls in classes: bpy.utils.register_class(cls)
     bpy.types.Scene.aod_settings = PointerProperty(type=AOD_Settings)
     bpy.types.Scene.pcycle_props = PointerProperty(type=PCycleProps)
+
 
 def unregister():
     del bpy.types.Scene.aod_settings
